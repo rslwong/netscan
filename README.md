@@ -7,7 +7,7 @@ A Python subnet scanner that discovers online hosts, resolves their hostnames, d
 - **Auto-detects** your local IP and scans the `/24` subnet
 - **Three-phase parallel scan:**
   1. **Host discovery** — ICMP ping with TTL capture; TCP fallback for ICMP-blocked hosts
-  2. **Port scan** — 63 well-known ports scanned per host by default (see list below)
+  2. **Port scan** — 63 well-known TCP ports + targeted UDP probes (DNS, SNMP, CoAP) per host by default
   3. **Banner grab** — identifies the service version on each open port
 - **OS hint from TTL** — infers Linux/macOS, Windows, or network device from the ping TTL
 - **Three hostname resolution methods**, tried in order:
@@ -34,14 +34,20 @@ source venv/bin/activate      # macOS / Linux
 # venv\Scripts\activate       # Windows
 
 # Install dependencies
-pip install zeroconf mac-vendor-lookup
+pip install -r requirements.txt
 ```
 
 ## Usage
 
 ```bash
-# Full scan: host discovery + port scanning + banner grabbing
+# Full scan: auto-detect local /24 subnet
 venv/bin/python3 netscan.py
+
+# Scan a specific subnet
+venv/bin/python3 netscan.py --subnet 10.0.0.0/16
+
+# Scan a single host
+venv/bin/python3 netscan.py --host 192.168.2.50
 
 # Host discovery only (faster — skips port scanning and banners)
 venv/bin/python3 netscan.py --no-ports
@@ -60,12 +66,16 @@ venv/bin/python3 netscan.py --port-timeout 0.3 --banner-timeout 1.5 --mdns-time 
 
 | Flag | Default | Description |
 |---|---|---|
+| `--subnet CIDR` | auto /24 | Subnet to scan, e.g. `10.0.0.0/16` |
+| `--host IP` | — | Scan a single IP instead of a full subnet |
 | `--no-ports` | — | Skip port scanning (and banner grabbing) |
 | `--no-banners` | — | Skip banner grabbing only |
 | `--ports PORT[,PORT...]` | all 63 | Comma-separated list of ports to scan |
 | `--port-timeout SEC` | `0.5` | TCP connect timeout per port (seconds) |
 | `--banner-timeout SEC` | `2.0` | Banner read timeout per port (seconds) |
 | `--mdns-time SEC` | `5.0` | How long to listen for mDNS announcements |
+
+`--subnet` and `--host` are mutually exclusive.
 
 ## Sample output
 
