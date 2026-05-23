@@ -26,6 +26,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -132,10 +133,32 @@ PORT_NAMES: dict[int, str] = {
 DEFAULT_PORTS = sorted(PORT_NAMES.keys())
 
 # Port sets used during banner grabbing
-_HTTPS_PORTS = frozenset({443, 8443, 8920, 4343, 5001, 993, 995, 465})
-_HTTP_PORTS  = frozenset({80, 8008, 8080, 8888, 3000, 4200, 5000, 9000, 9090, 8096, 8123, 32400})
-_RTSP_PORTS  = frozenset({554, 8554})
-_FTP_SMTP    = frozenset({21, 25, 587})
+_HTTPS_PORTS       = frozenset({443, 8443, 8920, 4343, 5001})       # HTTP over TLS — send HEAD
+_TLS_PASSIVE_PORTS = frozenset({993, 995, 465, 8883})               # TLS but server speaks first (IMAP/POP3/SMTP/MQTT)
+_HTTP_PORTS        = frozenset({80, 8008, 8080, 8888, 3000, 4200, 5000, 9000, 9090, 8096, 8123, 32400})
+_RTSP_PORTS        = frozenset({554, 8554})
+_FTP_SMTP          = frozenset({21, 25, 465, 587})
+
+# UDP probes: ports that are UDP-only (or primarily UDP) and will respond to a probe.
+# Keyed by port number; value is the payload to send.
+# Only ports that return a positive response are marked open — timeouts are discarded.
+_UDP_PROBES: dict[int, bytes] = {
+    53: (                                    # DNS query for root NS record
+        b'\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+        b'\x00\x00\x02\x00\x01'
+    ),
+    161: (                                   # SNMP v1 GetRequest sysDescr.0, community "public"
+        b'\x30\x26'                          # SEQUENCE, length 38
+        b'\x02\x01\x00'                      # version 0 (SNMPv1)
+        b'\x04\x06public'                    # community "public"
+        b'\xa0\x19'                          # GetRequest PDU
+        b'\x02\x01\x00\x02\x01\x00\x02\x01\x00'  # request-id, error-status, error-index
+        b'\x30\x0e\x30\x0c'                  # variable-bindings
+        b'\x06\x08\x2b\x06\x01\x02\x01\x01\x01\x00'  # OID 1.3.6.1.2.1.1.1.0 (sysDescr.0)
+        b'\x05\x00'                          # NULL
+    ),
+    5683: b'\x40\x00\x00\x01',              # CoAP CON ping (expects RST)
+}
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +176,7 @@ class Host:
     mac: str | None = None
     vendor: str | None = None
     open_ports: list[int] = field(default_factory=list)
+    open_udp_ports: list[int] = field(default_factory=list)
     banners: dict[int, str] = field(default_factory=dict)
 
 
@@ -314,7 +338,7 @@ def _parse_banner(port: int, data: bytes) -> str | None:
 
 def grab_banner(ip: str, port: int, timeout: float = 2.0) -> str | None:
     """Connect to ip:port and return a short service banner."""
-    use_tls = port in _HTTPS_PORTS
+    use_tls = port in _HTTPS_PORTS or port in _TLS_PASSIVE_PORTS
     try:
         with socket.create_connection((ip, port), timeout=timeout) as raw:
             if use_tls:
@@ -322,7 +346,9 @@ def grab_banner(ip: str, port: int, timeout: float = 2.0) -> str | None:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
                 with ctx.wrap_socket(raw, server_hostname=ip) as s:
-                    s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
+                    if port in _HTTPS_PORTS:
+                        s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
+                    # _TLS_PASSIVE_PORTS: server speaks first, just read
                     return _parse_banner(port, _read_bytes(s))
             else:
                 if port in _HTTP_PORTS:
@@ -342,6 +368,22 @@ def check_port(ip: str, port: int, timeout: float) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         return s.connect_ex((ip, port)) == 0
+
+
+def check_udp_port(ip: str, port: int, probe: bytes, timeout: float) -> bool:
+    """Send a UDP probe and return True only on a positive response.
+
+    ConnectionRefusedError means ICMP port-unreachable (definitely closed).
+    socket.timeout means filtered/unknown — not reported as open.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(probe, (ip, port))
+            s.recvfrom(512)
+            return True
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +410,7 @@ _MDNS_SERVICE_TYPES = [
 
 def collect_mdns_names(listen_secs: float = 5.0) -> dict[str, str]:
     ip_to_name: dict[str, str] = {}
+    _lock = threading.Lock()
 
     def on_change(zeroconf: Zeroconf, service_type: str, name: str, state_change: ServiceStateChange) -> None:
         if state_change is not ServiceStateChange.Added:
@@ -376,9 +419,10 @@ def collect_mdns_names(listen_secs: float = 5.0) -> dict[str, str]:
         if not info or not info.server:
             return
         hostname = info.server.rstrip(".")
-        for addr in info.parsed_addresses():
-            if addr not in ip_to_name:
-                ip_to_name[addr] = hostname
+        with _lock:
+            for addr in info.parsed_addresses():
+                if addr not in ip_to_name:
+                    ip_to_name[addr] = hostname
 
     zc = Zeroconf()
     _browsers = [ServiceBrowser(zc, svc, handlers=[on_change]) for svc in _MDNS_SERVICE_TYPES]
@@ -388,14 +432,15 @@ def collect_mdns_names(listen_secs: float = 5.0) -> dict[str, str]:
 
 
 def resolve_dns(ip: str, timeout: float = 2.0) -> str | None:
-    old = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(timeout)
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except (socket.herror, socket.gaierror, OSError):
-        return None
-    finally:
-        socket.setdefaulttimeout(old)
+    # gethostbyaddr has no per-call timeout; socket.setdefaulttimeout is
+    # process-global and causes races when called from many threads at once.
+    # Wrap in a Future so the timeout doesn't touch any shared state.
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(socket.gethostbyaddr, ip)
+        try:
+            return fut.result(timeout=timeout)[0]
+        except Exception:
+            return None
 
 
 def _build_nbstat_packet() -> bytes:
@@ -487,12 +532,14 @@ def discover_host(ip: str, local_ip: str, mdns_map: dict[str, str]) -> Host | No
 # Subnet sweep
 # ---------------------------------------------------------------------------
 
-def _fmt_ports(open_ports: list[int], banners: dict[int, str]) -> str:
+def _fmt_ports(open_ports: list[int], open_udp_ports: list[int], banners: dict[int, str]) -> str:
     parts = []
     for p in open_ports:
         name = PORT_NAMES.get(p, "?")
         banner = banners.get(p)
         parts.append(f"{p}/{name}[{banner}]" if banner else f"{p}/{name}")
+    for p in open_udp_ports:
+        parts.append(f"{p}/{PORT_NAMES.get(p, '?')}(udp)")
     return "  ".join(parts)
 
 
@@ -508,7 +555,12 @@ def scan_subnet(
     port_workers: int = 200,
     banner_workers: int = 50,
 ) -> list[Host]:
-    all_ips = [str(ip) for ip in network.hosts()]
+    # /32 has no "hosts" (network == broadcast); treat the address itself as the target
+    all_ips = (
+        [str(network.network_address)]
+        if network.prefixlen == 32
+        else [str(ip) for ip in network.hosts()]
+    )
 
     # ── Phase 1: host discovery (ping + hostname) ───────────────────────────
     print(f"Phase 1: Discovering hosts in {network} ({len(all_ips)} IPs)...\n")
@@ -540,6 +592,25 @@ def scan_subnet(
             host.open_ports.sort()
         total_open = sum(len(h.open_ports) for h in online.values())
         print(f"  → {total_open} open port(s) found\n")
+
+    # ── Phase 2b: UDP scan (only ports we can meaningfully probe) ───────────
+    udp_ports = [p for p in _UDP_PROBES if not ports or p in set(ports)]
+    if udp_ports and online:
+        udp_tasks = [(ip, p) for ip in online for p in udp_ports]
+        print(f"Phase 2b: UDP scanning {len(online)} hosts × {len(udp_ports)} ports = {len(udp_tasks)} probes...")
+        with ThreadPoolExecutor(max_workers=port_workers) as ex:
+            futures = {
+                ex.submit(check_udp_port, ip, p, _UDP_PROBES[p], port_timeout): (ip, p)
+                for ip, p in udp_tasks
+            }
+            for fut in as_completed(futures):
+                if fut.result():
+                    ip, port = futures[fut]
+                    online[ip].open_udp_ports.append(port)
+        for host in online.values():
+            host.open_udp_ports.sort()
+        total_udp = sum(len(h.open_udp_ports) for h in online.values())
+        print(f"  → {total_udp} open UDP port(s) found\n")
 
     # ── Phase 3: banner grab (single shared pool across all open ports) ─────
     if do_banners and ports and online:
@@ -584,7 +655,8 @@ def print_summary(hosts: list[Host], network: ipaddress.IPv4Network, ports: list
         os    = f"  {h.os_hint}" if h.os_hint else ""
         mac   = f"  {h.mac}" if h.mac else ""
         vend  = f"  ({h.vendor})" if h.vendor else ""
-        ports_str = f"  {_fmt_ports(h.open_ports, h.banners)}" if h.open_ports else ""
+        has_ports = h.open_ports or h.open_udp_ports
+        ports_str = f"  {_fmt_ports(h.open_ports, h.open_udp_ports, h.banners)}" if has_ports else ""
         print(f"  {h.ip:<18} {name:<38} [{meth}]{os}{mac}{vend}{ports_str}")
 
 
@@ -594,8 +666,13 @@ def print_summary(hosts: list[Host], network: ipaddress.IPv4Network, ports: list
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Scan a /24 subnet for online hosts, resolve hostnames, and check open ports."
+        description="Scan a subnet for online hosts, resolve hostnames, and check open ports."
     )
+    target = p.add_mutually_exclusive_group()
+    target.add_argument("--subnet", metavar="CIDR",
+                        help="Subnet to scan, e.g. 10.0.0.0/16 (default: auto-detect /24)")
+    target.add_argument("--host", metavar="IP",
+                        help="Scan a single IP instead of a full subnet")
     p.add_argument("--no-ports",   action="store_true", help="Skip port scanning (and banners)")
     p.add_argument("--no-banners", action="store_true", help="Skip banner grabbing")
     p.add_argument("--ports", metavar="PORT[,PORT...]", help="Comma-separated list of ports to scan")
@@ -620,7 +697,22 @@ def main() -> None:
 
     old_fd, new_fd = raise_fd_limit()
     local_ip = get_local_ip()
-    network  = get_subnet(local_ip)
+
+    if args.host:
+        try:
+            ipaddress.IPv4Address(args.host)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        network = ipaddress.IPv4Network(f"{args.host}/32")
+    elif args.subnet:
+        try:
+            network = ipaddress.IPv4Network(args.subnet, strict=False)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        network = get_subnet(local_ip)
 
     print(f"Local IP : {local_ip}")
     print(f"Network  : {network}")
