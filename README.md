@@ -97,14 +97,9 @@ Phase 3: Grabbing banners on 18 open port(s)...
   192.168.2.0/24  —  12 online  /  8 resolved  /  63 ports scanned
 ════════════════════════════════════════════════════════════════════════════════
 
-  192.168.2.1        (unresolved)                           [-]  aa:bb:cc:dd:ee:ff  (Netgear)
-                     53/DNS  80/HTTP[nginx/1.24]  443/HTTPS
-
-  192.168.2.134      HP28C5C8711735.local                   [mDNS]  Linux/macOS
-                     80/HTTP  443/HTTPS  631/IPP  9100/JetDirect
-
-  192.168.2.161      nas.local                              [mDNS]  Linux/macOS
-                     22/SSH[SSH-2.0-OpenSSH_9.3]  80/HTTP  5000/Synology-DSM
+  192.168.2.1        (unresolved)                           [-]  aa:bb:cc:dd:ee:ff  (Netgear)  53/DNS  80/HTTP[nginx/1.24]  443/HTTPS
+  192.168.2.134      HP28C5C8711735.local                   [mDNS]  Linux/macOS  80/HTTP  443/HTTPS  631/IPP  9100/JetDirect
+  192.168.2.161      nas.local                              [mDNS]  Linux/macOS  22/SSH[SSH-2.0-OpenSSH_9.3]  80/HTTP  5000/Synology-DSM
   ...
 ```
 

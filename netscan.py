@@ -584,11 +584,8 @@ def print_summary(hosts: list[Host], network: ipaddress.IPv4Network, ports: list
         os    = f"  {h.os_hint}" if h.os_hint else ""
         mac   = f"  {h.mac}" if h.mac else ""
         vend  = f"  ({h.vendor})" if h.vendor else ""
-        print(f"  {h.ip:<18} {name:<38} [{meth}]{os}{mac}{vend}")
-        ports_str = _fmt_ports(h.open_ports, h.banners)
-        if ports_str:
-            print(f"  {'':18} {ports_str}")
-        print()
+        ports_str = f"  {_fmt_ports(h.open_ports, h.banners)}" if h.open_ports else ""
+        print(f"  {h.ip:<18} {name:<38} [{meth}]{os}{mac}{vend}{ports_str}")
 
 
 # ---------------------------------------------------------------------------
